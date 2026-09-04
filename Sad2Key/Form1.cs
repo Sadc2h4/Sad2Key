@@ -10,35 +10,55 @@ namespace Sad2Key
         private const int MaxDevices = 16;
         private const int MaxButtons = 32;
         private const int JoyReturnAll = 0x000000FF;
-        private const uint InputKeyboard = 1;
-        private const uint KeyEventFExtendedKey = 0x0001;
-        private const uint KeyEventFKeyUp = 0x0002;
+        private const string Joystick1SectionName = "[Joystick 1]";
+        private const string SettingsFileName = "settings.json";
+        private const string JsonProfileFileName = "keymap.json";
 
-        private readonly ComboBox deviceComboBox;
-        private readonly Button refreshButton;
-        private readonly Button startButton;
-        private readonly Button stopButton;
-        private readonly Button testKeyButton;
-        private readonly CheckBox inputLogCheckBox;
-        private readonly ListBox profileListBox;
-        private readonly Button profileRefreshButton;
-        private readonly Button profileNewButton;
-        private readonly Button profileSaveButton;
-        private readonly Button profileFolderButton;
-        private readonly Label currentProfileLabel;
-        private readonly TextBox focusSinkTextBox;
-        private readonly Label statusLabel;
-        private readonly ListView stateListView;
+        private Theme theme = Theme.Dark;
+
+        // 画面部品
+        private readonly TableLayoutPanel rootLayout;
+        private readonly TileButton statusTile;
+        private readonly TileButton controllerTile;
+        private readonly TileButton profileTile;
+        private readonly TileButton sidewaysTile;
+        private readonly TileButton inputLogTile;
+        private readonly TileButton testKeyTile;
+        private readonly TileButton themeTile;
+        private readonly RoundButton saveButton;
+        private readonly RoundButton powerButton;
+        private readonly RoundedPanel mappingPanel;
+        private readonly RoundedPanel logPanel;
+        private readonly Panel logHeaderPanel;
+        private readonly Label logHeaderLabel;
+        private readonly Label logChevronLabel;
+        private readonly Label hintLabel;
+        private readonly Panel bottomPanel;
+        private readonly ThemedListView stateListView;
         private readonly TextBox logTextBox;
-        private readonly TextBox configPathTextBox;
+        private readonly TextBox focusSinkTextBox;
+        private readonly ContextMenuStrip deviceMenu;
+        private readonly ContextMenuStrip profileMenu;
+        private readonly ToolTip toolTip = new();
+
+        // 状態
         private readonly List<DeviceInfo> devices = [];
+        private readonly List<ProfileInfo> profiles = [];
         private readonly List<SwitchHidController> switchHidControllers = [];
-        private readonly Dictionary<string, List<Keys>> keyMappings = [];
-        private readonly HashSet<string> activeInputs = [];
-        private readonly object inputLock = new();
+        private readonly Dictionary<string, KeyMapping> keyMappings = [];
+        private readonly KeySender keySender;
+        private readonly InputEngine inputEngine;
+        private readonly List<string> preservedHeaderLines = [];       // cfgの[Joystick 1]より前の行（原文保持用）
+        private readonly List<string> preservedJoystickLines = [];     // cfgの[Joystick 1]内の行（原文保持用）
+        private readonly List<string> preservedTrailingLines = [];     // cfgの[Joystick 1]より後の行（原文保持用）
+        private readonly string applicationDirectory;                  // exeのあるフォルダ（ポータブル設定の置き場所）
         private readonly string configPath;
         private readonly string settingsPath;
         private string profileDirectory;
+        private bool joyConSidewaysStick = true;
+        private bool isLogCollapsed;
+        private DeviceInfo? selectedDevice;
+        private ProfileInfo selectedProfile = ProfileInfo.JsonDefault;
         private CancellationTokenSource? pollingCancellationTokenSource;
         private Task? pollingTask;
         private DeviceInfo? activeDevice;
@@ -52,224 +72,356 @@ namespace Sad2Key
         public Form1()
         {
             InitializeComponent();
-            configPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "Sad2Key",
-                "keymap.json");
-            settingsPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "Sad2Key",
-                "settings.json");
-            profileDirectory = LoadProfileDirectorySetting() ?? FindProfileDirectory();
+            applicationDirectory = Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
+            configPath = Path.Combine(applicationDirectory, JsonProfileFileName);
+            settingsPath = Path.Combine(applicationDirectory, SettingsFileName);
+            var settings = LoadSettings();
+            profileDirectory = settings?.ProfileDirectory is { } savedDirectory && Directory.Exists(savedDirectory)
+                ? savedDirectory
+                : FindProfileDirectory();
+            joyConSidewaysStick = settings?.JoyConSidewaysStick ?? true;
+            isLogCollapsed = settings?.LogCollapsed ?? false;
+            theme = Theme.FromMode(Enum.TryParse<ThemeMode>(settings?.Theme, true, out var savedMode) ? savedMode : ThemeMode.Dark);
+            keySender = new KeySender(AppendLog);
+            inputEngine = new InputEngine(keySender, keyMappings, AppendLog);
 
-            deviceComboBox = new ComboBox();
-            refreshButton = new Button();
-            startButton = new Button();
-            stopButton = new Button();
-            testKeyButton = new Button();
-            inputLogCheckBox = new CheckBox();
-            profileListBox = new NonKeyboardListBox();
-            profileRefreshButton = new Button();
-            profileNewButton = new Button();
-            profileSaveButton = new Button();
-            profileFolderButton = new Button();
-            currentProfileLabel = new Label();
-            focusSinkTextBox = new TextBox();
-            statusLabel = new Label();
-            stateListView = new DoubleBufferedListView();
+            rootLayout = new TableLayoutPanel();
+            statusTile = new TileButton();
+            controllerTile = new TileButton();
+            profileTile = new TileButton();
+            sidewaysTile = new TileButton();
+            inputLogTile = new TileButton();
+            testKeyTile = new TileButton();
+            themeTile = new TileButton();
+            saveButton = new RoundButton();
+            powerButton = new RoundButton();
+            mappingPanel = new RoundedPanel();
+            logPanel = new RoundedPanel();
+            logHeaderPanel = new Panel();
+            logHeaderLabel = new Label();
+            logChevronLabel = new Label();
+            hintLabel = new Label();
+            bottomPanel = new Panel();
+            stateListView = new ThemedListView();
             logTextBox = new TextBox();
-            configPathTextBox = new TextBox();
+            focusSinkTextBox = new TextBox();
+            deviceMenu = ThemedMenu.Create(theme);
+            profileMenu = ThemedMenu.Create(theme);
+
+            LoadApplicationIcon();
             InitializeUserInterface();
+            ApplyTheme();
             LoadOrCreateConfig();
             RefreshProfiles();
             RefreshDevices();
+            UpdateStatusTile();
 
             FormClosing += Form1_FormClosing;
         }
 
         //-------------------------------------------------------------------------------
-        // 画面部品を配置する処理
+        // 論理ピクセルをDPIに合わせた実ピクセルへ変換する処理
+        //-------------------------------------------------------------------------------
+        private int S(int value)
+        {
+            return ThemedDrawing.Scale(this, value);
+        }
+
+        //-------------------------------------------------------------------------------
+        // 埋め込みリソースからアプリアイコンを読み込む処理
+        //-------------------------------------------------------------------------------
+        private void LoadApplicationIcon()
+        {
+            try
+            {
+                using var stream = typeof(Form1).Assembly.GetManifestResourceStream("Sad2Key.exe_icon.ico");
+
+                if (stream is not null)
+                {
+                    Icon = new Icon(stream);
+                }
+            }
+            catch
+            {
+                // アイコンが無くても動作には影響しない
+            }
+        }
+
+        //-------------------------------------------------------------------------------
+        // 画面部品を配置する処理（参考UIのタイル構成）
         //-------------------------------------------------------------------------------
         private void InitializeUserInterface()
         {
-            var rootLayout = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 1,
-                RowCount = 4,
-                Padding = new Padding(12),
-            };
-            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 140));
-            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-            rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 58));
-            rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 42));
+            ClientSize = new Size(S(780), S(900));
+            MinimumSize = new Size(S(700), S(760));
+            Font = Theme.BodyFont;
+            DoubleBuffered = true;
+
+            rootLayout.Dock = DockStyle.Fill;
+            rootLayout.ColumnCount = 1;
+            rootLayout.RowCount = 5;
+            rootLayout.Padding = new Padding(S(14), S(14), S(14), S(8));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, S(72)));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, S(264)));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, S(170)));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, S(68)));
             Controls.Add(rootLayout);
 
-            var topLayout = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 6,
-                RowCount = 4,
-            };
-            topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
-            topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
-            topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
-            topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
-            topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
-            topLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-            topLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-            topLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-            topLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-            rootLayout.Controls.Add(topLayout, 0, 0);
+            // 状態表示ピル
+            statusTile.Interactive = false;
+            statusTile.Glyph = Glyphs.Link;
+            statusTile.Dock = DockStyle.Fill;
+            statusTile.Margin = new Padding(S(6), 0, S(6), S(6));
+            rootLayout.Controls.Add(statusTile, 0, 0);
 
-            topLayout.Controls.Add(new Label
-            {
-                Text = "Controller",
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleLeft,
-            }, 0, 0);
-
-            deviceComboBox.Dock = DockStyle.Fill;
-            deviceComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
-            topLayout.Controls.Add(deviceComboBox, 1, 0);
-
-            refreshButton.Text = "Refresh";
-            refreshButton.Dock = DockStyle.Fill;
-            refreshButton.Click += RefreshButton_Click;
-            topLayout.Controls.Add(refreshButton, 2, 0);
-
-            startButton.Text = "Start";
-            startButton.Dock = DockStyle.Fill;
-            startButton.Click += StartButton_Click;
-            topLayout.Controls.Add(startButton, 3, 0);
-
-            stopButton.Text = "Stop";
-            stopButton.Dock = DockStyle.Fill;
-            stopButton.Enabled = false;
-            stopButton.Click += StopButton_Click;
-            topLayout.Controls.Add(stopButton, 4, 0);
-
-            testKeyButton.Text = "Test Key";
-            testKeyButton.Dock = DockStyle.Fill;
-            testKeyButton.Click += TestKeyButton_Click;
-            topLayout.Controls.Add(testKeyButton, 5, 0);
-
-            topLayout.Controls.Add(new Label
-            {
-                Text = "Config",
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleLeft,
-            }, 0, 1);
-
-            configPathTextBox.Dock = DockStyle.Fill;
-            configPathTextBox.ReadOnly = true;
-            configPathTextBox.Text = configPath;
-            topLayout.SetColumnSpan(configPathTextBox, 5);
-            topLayout.Controls.Add(configPathTextBox, 1, 1);
-
-            inputLogCheckBox.Text = "Input event log";
-            inputLogCheckBox.Dock = DockStyle.Fill;
-            inputLogCheckBox.Checked = false;
-            inputLogCheckBox.CheckedChanged += InputLogCheckBox_CheckedChanged;
-            topLayout.SetColumnSpan(inputLogCheckBox, 5);
-            topLayout.Controls.Add(inputLogCheckBox, 1, 2);
-
-            topLayout.Controls.Add(new Label
-            {
-                Text = "Profile",
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleLeft,
-            }, 0, 3);
-
-            currentProfileLabel.Dock = DockStyle.Fill;
-            currentProfileLabel.BorderStyle = BorderStyle.FixedSingle;
-            currentProfileLabel.TextAlign = ContentAlignment.MiddleLeft;
-            currentProfileLabel.Padding = new Padding(8, 0, 0, 0);
-            topLayout.SetColumnSpan(currentProfileLabel, 4);
-            topLayout.Controls.Add(currentProfileLabel, 1, 3);
-
-            statusLabel.Dock = DockStyle.Fill;
-            statusLabel.TextAlign = ContentAlignment.MiddleLeft;
-            rootLayout.Controls.Add(statusLabel, 0, 1);
-
-            var mappingLayout = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 2,
-                RowCount = 1,
-            };
-            mappingLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
-            mappingLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            rootLayout.Controls.Add(mappingLayout, 0, 2);
-
-            var profilePanel = new TableLayoutPanel
+            // タイル2列×3行
+            var tilesGrid = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 2,
                 RowCount = 3,
+                Margin = new Padding(0),
             };
-            profilePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-            profilePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-            profilePanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            profilePanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-            profilePanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-            mappingLayout.Controls.Add(profilePanel, 0, 0);
+            tilesGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            tilesGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            tilesGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 33.3f));
+            tilesGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 33.3f));
+            tilesGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 33.4f));
+            rootLayout.Controls.Add(tilesGrid, 0, 1);
 
-            profileListBox.Dock = DockStyle.Fill;
-            profileListBox.SelectedIndexChanged += ProfileListBox_SelectedIndexChanged;
-            profilePanel.SetColumnSpan(profileListBox, 2);
-            profilePanel.Controls.Add(profileListBox, 0, 0);
+            ConfigureTile(controllerTile, Glyphs.Game, "Controller", true);
+            controllerTile.Click += ControllerTile_Click;
+            tilesGrid.Controls.Add(controllerTile, 0, 0);
 
-            profileNewButton.Text = "New";
-            profileNewButton.Dock = DockStyle.Fill;
-            profileNewButton.Click += ProfileNewButton_Click;
-            profilePanel.Controls.Add(profileNewButton, 0, 1);
+            ConfigureTile(profileTile, Glyphs.Document, "Profile", true);
+            profileTile.Click += ProfileTile_Click;
+            tilesGrid.Controls.Add(profileTile, 1, 0);
 
-            profileSaveButton.Text = "Save";
-            profileSaveButton.Dock = DockStyle.Fill;
-            profileSaveButton.Click += ProfileSaveButton_Click;
-            profilePanel.Controls.Add(profileSaveButton, 1, 1);
+            ConfigureTile(sidewaysTile, Glyphs.Rotate, "Joy-Con stick sideways", false);
+            sidewaysTile.Click += SidewaysTile_Click;
+            tilesGrid.Controls.Add(sidewaysTile, 0, 1);
 
-            profileFolderButton.Text = "Folder";
-            profileFolderButton.Dock = DockStyle.Fill;
-            profileFolderButton.Click += ProfileFolderButton_Click;
-            profilePanel.Controls.Add(profileFolderButton, 0, 2);
+            ConfigureTile(inputLogTile, Glyphs.Log, "Input event log", false);
+            inputLogTile.Click += InputLogTile_Click;
+            tilesGrid.Controls.Add(inputLogTile, 1, 1);
 
-            profileRefreshButton.Text = "Reload";
-            profileRefreshButton.Dock = DockStyle.Fill;
-            profileRefreshButton.Click += ProfileRefreshButton_Click;
-            profilePanel.Controls.Add(profileRefreshButton, 1, 2);
+            ConfigureTile(testKeyTile, Glyphs.Keyboard, "Test key", false);
+            testKeyTile.Subtitle = "Send A to the focused window";
+            testKeyTile.Click += TestKeyTile_Click;
+            tilesGrid.Controls.Add(testKeyTile, 0, 2);
+
+            ConfigureTile(themeTile, Glyphs.Moon, "Theme", false);
+            themeTile.Click += ThemeTile_Click;
+            tilesGrid.Controls.Add(themeTile, 1, 2);
+
+            // マッピング一覧
+            mappingPanel.Dock = DockStyle.Fill;
+            mappingPanel.Margin = new Padding(S(6));
+            mappingPanel.Padding = new Padding(S(14), S(12), S(14), S(12));
+            rootLayout.Controls.Add(mappingPanel, 0, 2);
 
             stateListView.Dock = DockStyle.Fill;
-            stateListView.View = View.Details;
-            stateListView.FullRowSelect = true;
-            stateListView.GridLines = true;
-            stateListView.Columns.Add("Input", 180);
-            stateListView.Columns.Add("Key", 120);
-            stateListView.Columns.Add("Active", 100);
+            stateListView.Columns.Add("Input", S(170));
+            stateListView.Columns.Add("Key", S(300));
             stateListView.DoubleClick += StateListView_DoubleClick;
-            mappingLayout.Controls.Add(stateListView, 1, 0);
+            stateListView.ClientSizeChanged += (_, _) => FitListColumns();
+            mappingPanel.Controls.Add(stateListView);
+
+            // ログ（折りたたみ可）
+            logPanel.Dock = DockStyle.Fill;
+            logPanel.Margin = new Padding(S(6));
+            logPanel.Padding = new Padding(S(14), S(6), S(14), S(10));
+            rootLayout.Controls.Add(logPanel, 0, 3);
 
             logTextBox.Dock = DockStyle.Fill;
             logTextBox.Multiline = true;
             logTextBox.ReadOnly = true;
+            logTextBox.BorderStyle = BorderStyle.None;
             logTextBox.ScrollBars = ScrollBars.Vertical;
-            rootLayout.Controls.Add(logTextBox, 0, 3);
+            logTextBox.Font = Theme.SmallFont;
+            logPanel.Controls.Add(logTextBox);
+
+            logHeaderPanel.Dock = DockStyle.Top;
+            logHeaderPanel.Height = S(30);
+            logHeaderPanel.Cursor = Cursors.Hand;
+            logHeaderPanel.Click += LogHeader_Click;
+            logPanel.Controls.Add(logHeaderPanel);
+
+            logHeaderLabel.Text = "Log";
+            logHeaderLabel.Font = Theme.TitleFont;
+            logHeaderLabel.Dock = DockStyle.Left;
+            logHeaderLabel.Width = S(120);
+            logHeaderLabel.TextAlign = ContentAlignment.MiddleLeft;
+            logHeaderLabel.Cursor = Cursors.Hand;
+            logHeaderLabel.Click += LogHeader_Click;
+            logHeaderPanel.Controls.Add(logHeaderLabel);
+
+            logChevronLabel.Font = Theme.GlyphFont;
+            logChevronLabel.Dock = DockStyle.Right;
+            logChevronLabel.Width = S(30);
+            logChevronLabel.TextAlign = ContentAlignment.MiddleRight;
+            logChevronLabel.Cursor = Cursors.Hand;
+            logChevronLabel.Click += LogHeader_Click;
+            logHeaderPanel.Controls.Add(logChevronLabel);
+
+            // 下部の丸ボタン
+            bottomPanel.Dock = DockStyle.Fill;
+            bottomPanel.Margin = new Padding(S(6), S(4), S(6), 0);
+            rootLayout.Controls.Add(bottomPanel, 0, 4);
+
+            hintLabel.Text = "Double-click a row to edit its key assignment.";
+            hintLabel.Font = Theme.SmallFont;
+            hintLabel.Dock = DockStyle.Left;
+            hintLabel.Width = S(360);
+            hintLabel.TextAlign = ContentAlignment.MiddleLeft;
+            bottomPanel.Controls.Add(hintLabel);
+
+            var roundButtonPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Right,
+                FlowDirection = FlowDirection.RightToLeft,
+                Width = S(150),
+                WrapContents = false,
+                Padding = new Padding(0),
+            };
+            bottomPanel.Controls.Add(roundButtonPanel);
+
+            powerButton.Glyph = Glyphs.Power;
+            powerButton.Size = new Size(S(60), S(60));
+            powerButton.Margin = new Padding(S(6), 0, 0, 0);
+            powerButton.Click += PowerButton_Click;
+            toolTip.SetToolTip(powerButton, "Start / Stop mapping");
+            roundButtonPanel.Controls.Add(powerButton);
+
+            saveButton.Glyph = Glyphs.Save;
+            saveButton.Size = new Size(S(60), S(60));
+            saveButton.Margin = new Padding(S(6), 0, S(6), 0);
+            saveButton.Click += SaveButton_Click;
+            toolTip.SetToolTip(saveButton, "Save profile");
+            roundButtonPanel.Controls.Add(saveButton);
 
             focusSinkTextBox.BorderStyle = BorderStyle.None;
             focusSinkTextBox.Location = new Point(-200, -200);
             focusSinkTextBox.Size = new Size(1, 1);
             focusSinkTextBox.TabStop = false;
             Controls.Add(focusSinkTextBox);
+
+            ApplyLogCollapsedState();
         }
 
         //-------------------------------------------------------------------------------
-        // プロファイル配置フォルダを探す処理
+        // タイルの共通設定を行う処理
         //-------------------------------------------------------------------------------
-        private static string FindProfileDirectory()
+        private void ConfigureTile(TileButton tile, string glyph, string title, bool showChevron)
         {
-            var directory = new DirectoryInfo(AppContext.BaseDirectory);
+            tile.Glyph = glyph;
+            tile.Title = title;
+            tile.ShowChevron = showChevron;
+            tile.Dock = DockStyle.Fill;
+            tile.Margin = new Padding(S(6));
+        }
+
+        //-------------------------------------------------------------------------------
+        // 一覧の列幅を表示幅に合わせる処理
+        //-------------------------------------------------------------------------------
+        private void FitListColumns()
+        {
+            if (stateListView.Columns.Count < 2)
+            {
+                return;
+            }
+
+            var keyWidth = stateListView.ClientSize.Width - stateListView.Columns[0].Width - S(4);
+            stateListView.Columns[1].Width = Math.Max(S(120), keyWidth);
+        }
+
+        //-------------------------------------------------------------------------------
+        // 現在のテーマを全部品へ適用する処理
+        //-------------------------------------------------------------------------------
+        private void ApplyTheme()
+        {
+            BackColor = theme.Background;
+            ForeColor = theme.Text;
+            rootLayout.BackColor = theme.Background;
+
+            foreach (var tile in new[] { statusTile, controllerTile, profileTile, sidewaysTile, inputLogTile, testKeyTile, themeTile })
+            {
+                tile.Theme = theme;
+            }
+
+            themeTile.Glyph = theme.IsDark ? Glyphs.Moon : Glyphs.Sun;
+            themeTile.Subtitle = theme.IsDark ? "Dark" : "Light";
+            saveButton.Theme = theme;
+            powerButton.Theme = theme;
+            mappingPanel.Theme = theme;
+            logPanel.Theme = theme;
+            stateListView.Theme = theme;
+            logHeaderPanel.BackColor = theme.Surface;
+            logHeaderLabel.BackColor = theme.Surface;
+            logHeaderLabel.ForeColor = theme.Text;
+            logChevronLabel.BackColor = theme.Surface;
+            logChevronLabel.ForeColor = theme.TextSecondary;
+            logTextBox.BackColor = theme.Surface;
+            logTextBox.ForeColor = theme.TextSecondary;
+            bottomPanel.BackColor = theme.Background;
+            hintLabel.BackColor = theme.Background;
+            hintLabel.ForeColor = theme.TextSecondary;
+            ThemedMenu.Apply(deviceMenu, theme);
+            ThemedMenu.Apply(profileMenu, theme);
+            NativeTheme.ApplyWindowTheme(this, theme);
+            NativeTheme.ApplyControlTheme(stateListView, theme);
+            NativeTheme.ApplyControlTheme(logTextBox, theme);
+            RepaintStateRows();
+            Invalidate(true);
+        }
+
+        //-------------------------------------------------------------------------------
+        // ハンドル作成時にタイトルバーとスクロールバーの配色を合わせる処理
+        //-------------------------------------------------------------------------------
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            NativeTheme.ApplyWindowTheme(this, theme);
+        }
+
+        //-------------------------------------------------------------------------------
+        // 表示直後にスクロールバー配色を合わせる処理（子ハンドル作成後に必要）
+        //-------------------------------------------------------------------------------
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            NativeTheme.ApplyControlTheme(stateListView, theme);
+            NativeTheme.ApplyControlTheme(logTextBox, theme);
+            FitListColumns();
+        }
+
+        //-------------------------------------------------------------------------------
+        // 状態表示ピルを更新する処理
+        //-------------------------------------------------------------------------------
+        private void UpdateStatusTile()
+        {
+            var isRunning = pollingTask is not null;
+            statusTile.IsOn = isRunning;
+            statusTile.Glyph = isRunning ? Glyphs.Play : Glyphs.Link;
+            statusTile.Title = isRunning ? "Running" : "Stopped";
+            statusTile.Subtitle = isRunning
+                ? $"{activeDevice?.ToString() ?? "-"}  ·  {selectedProfile.Name}"
+                : devices.Count <= 1
+                    ? "No controller found"
+                    : $"{devices.Count - 1} controller(s) found  ·  {selectedProfile.Name}";
+            powerButton.IsAccent = isRunning;
+            controllerTile.Enabled = !isRunning;
+            profileTile.Enabled = !isRunning;
+            saveButton.Enabled = !isRunning;
+        }
+
+        //-------------------------------------------------------------------------------
+        // プロファイル配置フォルダを探す処理（exeフォルダから親へたどって最初にcfgがある場所）
+        //-------------------------------------------------------------------------------
+        private string FindProfileDirectory()
+        {
+            var directory = new DirectoryInfo(applicationDirectory);
 
             while (directory is not null)
             {
@@ -281,91 +433,179 @@ namespace Sad2Key
                 directory = directory.Parent;
             }
 
-            return AppContext.BaseDirectory;
+            return applicationDirectory;
         }
 
         //-------------------------------------------------------------------------------
-        // 設定ファイルを読み込む処理
+        // 設定ファイル（keymap.json）を読み込む処理
         //-------------------------------------------------------------------------------
         private void LoadOrCreateConfig()
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
-
             var defaultMappings = CreateDefaultMappings();
 
-            if (!File.Exists(configPath))
+            try
             {
-                var json = JsonSerializer.Serialize(defaultMappings, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(configPath, json, Encoding.UTF8);
+                if (!File.Exists(configPath))
+                {
+                    var json = JsonSerializer.Serialize(defaultMappings, new JsonSerializerOptions { WriteIndented = true });
+                    File.WriteAllText(configPath, json, Encoding.UTF8);
+                }
+            }
+            catch (Exception exception)
+            {
+                AppendLog($"keymap.json could not be created: {exception.Message}");
             }
 
-            var config = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(configPath, Encoding.UTF8)) ?? [];
+            var config = new Dictionary<string, string>();
+
+            try
+            {
+                if (File.Exists(configPath))
+                {
+                    config = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(configPath, Encoding.UTF8)) ?? [];
+                }
+            }
+            catch (Exception exception)
+            {
+                AppendLog($"keymap.json could not be read: {exception.Message}");
+            }
 
             foreach (var mapping in defaultMappings)
             {
                 config.TryAdd(mapping.Key, mapping.Value);
             }
 
-            File.WriteAllText(configPath, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
             keyMappings.Clear();
 
             foreach (var pair in config)
             {
                 if (TryParseKeys(pair.Value, out var keys))
                 {
-                    keyMappings[pair.Key] = keys;
+                    keyMappings[pair.Key] = KeyMapping.CreateHold(keys);
                 }
             }
 
+            ClearPreservedProfileLines();
             RefreshMappingView();
             AppendLog($"Loaded config: {configPath}");
         }
 
         //-------------------------------------------------------------------------------
-        // cfgプロファイル一覧を更新する処理
+        // cfgプロファイル一覧を更新して選択する処理
         //-------------------------------------------------------------------------------
         private void RefreshProfiles(string selectedPathOverride = "")
         {
-            var selectedPath = selectedPathOverride.Length > 0
-                ? selectedPathOverride
-                : profileListBox.SelectedItem is ProfileInfo selectedProfile
-                ? selectedProfile.Path
-                : string.Empty;
-            profileListBox.Items.Clear();
-            profileListBox.Items.Add(ProfileInfo.JsonDefault);
+            var selectedPath = selectedPathOverride.Length > 0 ? selectedPathOverride : selectedProfile.Path;
+            profiles.Clear();
+            profiles.Add(ProfileInfo.JsonDefault);
 
-            foreach (var filePath in Directory.GetFiles(profileDirectory, "*.cfg").OrderBy(Path.GetFileName))
+            try
             {
-                profileListBox.Items.Add(new ProfileInfo(Path.GetFileName(filePath), filePath, false));
-            }
-
-            for (var itemIndex = 0; itemIndex < profileListBox.Items.Count; itemIndex++)
-            {
-                if (profileListBox.Items[itemIndex] is ProfileInfo profile && profile.Path == selectedPath)
+                foreach (var filePath in Directory.GetFiles(profileDirectory, "*.cfg").OrderBy(Path.GetFileName))
                 {
-                    profileListBox.SelectedIndex = itemIndex;
-                    return;
+                    profiles.Add(new ProfileInfo(Path.GetFileName(filePath), filePath, false));
                 }
             }
+            catch (Exception exception)
+            {
+                AppendLog($"Profile directory could not be read: {exception.Message}");
+            }
 
-            profileListBox.SelectedIndex = 0;
+            var target = profiles.FirstOrDefault(x => x.Path == selectedPath && selectedPath.Length > 0) ?? profiles[0];
+            SelectProfile(target);
         }
 
         //-------------------------------------------------------------------------------
-        // プロファイル再読込ボタン押下時にcfg一覧を更新する処理
+        // プロファイルを選択してキーマッピングを読み込む処理
         //-------------------------------------------------------------------------------
-        private void ProfileRefreshButton_Click(object? sender, EventArgs e)
+        private void SelectProfile(ProfileInfo profile)
         {
-            RefreshProfiles();
-            AppendLog($"Profile directory: {profileDirectory}");
+            selectedProfile = profile;
+            profileTile.Subtitle = profile.Name;
+            toolTip.SetToolTip(profileTile, profile.IsJsonDefault ? configPath : profile.Path);
+
+            if (profile.IsJsonDefault)
+            {
+                LoadOrCreateConfig();
+                AddEditableMappingRows(false);
+                RefreshMappingView();
+            }
+            else
+            {
+                LoadJoyToKeyProfile(profile.Path);
+            }
+
+            UpdateStatusTile();
+        }
+
+        //-------------------------------------------------------------------------------
+        // Profileタイル押下時に選択メニューを開く処理
+        //-------------------------------------------------------------------------------
+        private void ProfileTile_Click(object? sender, EventArgs e)
+        {
+            profileMenu.Items.Clear();
+
+            foreach (var profile in profiles)
+            {
+                var capturedProfile = profile;
+                profileMenu.Items.Add(ThemedMenu.CreateItem(profile.Name, (_, _) => SelectProfile(capturedProfile), profile == selectedProfile));
+            }
+
+            profileMenu.Items.Add(new ToolStripSeparator());
+            profileMenu.Items.Add(ThemedMenu.CreateItem("New profile...", ProfileNew_Click));
+            profileMenu.Items.Add(ThemedMenu.CreateItem("Save profile", SaveButton_Click));
+            profileMenu.Items.Add(ThemedMenu.CreateItem("Reload list", (_, _) => { RefreshProfiles(); AppendLog($"Profile directory: {profileDirectory}"); }));
+            profileMenu.Items.Add(ThemedMenu.CreateItem("Change folder...", ProfileFolder_Click));
+            ShowTileMenu(profileMenu, profileTile);
+        }
+
+        //-------------------------------------------------------------------------------
+        // Controllerタイル押下時に選択メニューを開く処理
+        //-------------------------------------------------------------------------------
+        private void ControllerTile_Click(object? sender, EventArgs e)
+        {
+            deviceMenu.Items.Clear();
+
+            foreach (var device in devices)
+            {
+                var capturedDevice = device;
+                deviceMenu.Items.Add(ThemedMenu.CreateItem(device.ToString(), (_, _) => SelectDevice(capturedDevice), device == selectedDevice));
+            }
+
+            if (devices.Count > 0)
+            {
+                deviceMenu.Items.Add(new ToolStripSeparator());
+            }
+
+            deviceMenu.Items.Add(ThemedMenu.CreateItem("Refresh controllers", (_, _) => { StopMapping(); RefreshDevices(); }));
+            ShowTileMenu(deviceMenu, controllerTile);
+        }
+
+        //-------------------------------------------------------------------------------
+        // タイルの直下にメニューを表示する処理
+        //-------------------------------------------------------------------------------
+        private void ShowTileMenu(ContextMenuStrip menu, TileButton tile)
+        {
+            menu.MinimumSize = new Size(tile.Width, 0);
+            menu.Show(tile, new Point(0, tile.Height + S(4)));
+        }
+
+        //-------------------------------------------------------------------------------
+        // コントローラーを選択する処理
+        //-------------------------------------------------------------------------------
+        private void SelectDevice(DeviceInfo? device)
+        {
+            selectedDevice = device;
+            controllerTile.Subtitle = device?.ToString() ?? "No controller found";
+            UpdateStatusTile();
         }
 
         //-------------------------------------------------------------------------------
         // 新規cfgプロファイルを作成する処理
         //-------------------------------------------------------------------------------
-        private void ProfileNewButton_Click(object? sender, EventArgs e)
+        private void ProfileNew_Click(object? sender, EventArgs e)
         {
-            using var dialog = new ProfileNameDialog();
+            using var dialog = new ProfileNameDialog(theme);
 
             if (dialog.ShowDialog(this) != DialogResult.OK)
             {
@@ -377,12 +617,13 @@ namespace Sad2Key
 
             if (File.Exists(filePath))
             {
-                MessageBox.Show("Profile already exists.", "Sad2Key", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "Profile already exists.", "Sad2Key", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             keyMappings.Clear();
-            AddEditableMappingRows();
+            ClearPreservedProfileLines();
+            AddEditableMappingRows(true);
             SaveJoyToKeyProfile(filePath);
             RefreshProfiles(filePath);
             AppendLog($"Created profile: {filePath}");
@@ -391,28 +632,29 @@ namespace Sad2Key
         //-------------------------------------------------------------------------------
         // 現在のプロファイルへマッピングを保存する処理
         //-------------------------------------------------------------------------------
-        private void ProfileSaveButton_Click(object? sender, EventArgs e)
+        private void SaveButton_Click(object? sender, EventArgs e)
         {
-            if (profileListBox.SelectedItem is not ProfileInfo profile)
+            if (pollingTask is not null)
             {
+                AppendLog("Stop mapping before saving");
                 return;
             }
 
-            if (profile.IsJsonDefault)
+            if (selectedProfile.IsJsonDefault)
             {
                 SaveJsonProfile();
                 AppendLog($"Saved profile: {configPath}");
                 return;
             }
 
-            SaveJoyToKeyProfile(profile.Path);
-            AppendLog($"Saved profile: {profile.Path}");
+            SaveJoyToKeyProfile(selectedProfile.Path);
+            AppendLog($"Saved profile: {selectedProfile.Path}");
         }
 
         //-------------------------------------------------------------------------------
         // cfgプロファイルフォルダを選択する処理
         //-------------------------------------------------------------------------------
-        private void ProfileFolderButton_Click(object? sender, EventArgs e)
+        private void ProfileFolder_Click(object? sender, EventArgs e)
         {
             using var dialog = new FolderBrowserDialog
             {
@@ -427,15 +669,15 @@ namespace Sad2Key
             }
 
             profileDirectory = dialog.SelectedPath;
-            SaveProfileDirectorySetting();
+            SaveSettings();
             RefreshProfiles();
             AppendLog($"Profile directory: {profileDirectory}");
         }
 
         //-------------------------------------------------------------------------------
-        // プロファイルフォルダ設定を読み込む処理
+        // アプリ設定（exe横のsettings.json）を読み込む処理
         //-------------------------------------------------------------------------------
-        private string? LoadProfileDirectorySetting()
+        private AppSettings? LoadSettings()
         {
             if (!File.Exists(settingsPath))
             {
@@ -444,10 +686,7 @@ namespace Sad2Key
 
             try
             {
-                var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(settingsPath, Encoding.UTF8));
-                return settings is not null && Directory.Exists(settings.ProfileDirectory)
-                    ? settings.ProfileDirectory
-                    : null;
+                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(settingsPath, Encoding.UTF8));
             }
             catch
             {
@@ -456,38 +695,87 @@ namespace Sad2Key
         }
 
         //-------------------------------------------------------------------------------
-        // プロファイルフォルダ設定を保存する処理
+        // アプリ設定（exe横のsettings.json）を保存する処理
         //-------------------------------------------------------------------------------
-        private void SaveProfileDirectorySetting()
+        private void SaveSettings()
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
-            var settings = new AppSettings(profileDirectory);
-            File.WriteAllText(settingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
+            try
+            {
+                var settings = new AppSettings(profileDirectory, joyConSidewaysStick, theme.Mode.ToString(), isLogCollapsed);
+                File.WriteAllText(settingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
+            }
+            catch (Exception exception)
+            {
+                AppendLog($"settings.json could not be saved: {exception.Message}");
+            }
         }
 
         //-------------------------------------------------------------------------------
-        // プロファイル選択変更時にキーマッピングを読み込む処理
+        // Joy-Con横持ちタイル押下時に設定を切り替える処理
         //-------------------------------------------------------------------------------
-        private void ProfileListBox_SelectedIndexChanged(object? sender, EventArgs e)
+        private void SidewaysTile_Click(object? sender, EventArgs e)
         {
-            if (profileListBox.SelectedItem is not ProfileInfo profile)
+            joyConSidewaysStick = !joyConSidewaysStick;
+
+            foreach (var switchHidController in switchHidControllers)
             {
-                return;
+                switchHidController.SidewaysStick = joyConSidewaysStick;
             }
 
-            currentProfileLabel.Text = profile.Name;
+            RefreshToggleTiles();
+            SaveSettings();
+        }
 
-            if (profile.IsJsonDefault)
-            {
-                LoadOrCreateConfig();
-                AddEditableMappingRows();
-                RefreshMappingView();
-                configPathTextBox.Text = configPath;
-                return;
-            }
+        //-------------------------------------------------------------------------------
+        // 入力ログタイル押下時に設定を切り替える処理
+        //-------------------------------------------------------------------------------
+        private void InputLogTile_Click(object? sender, EventArgs e)
+        {
+            enableInputLog = !enableInputLog;
+            inputEngine.EnableLog = enableInputLog;
+            RefreshToggleTiles();
+        }
 
-            LoadJoyToKeyProfile(profile.Path);
-            configPathTextBox.Text = profile.Path;
+        //-------------------------------------------------------------------------------
+        // テーマタイル押下時にダーク／ライトを切り替える処理
+        //-------------------------------------------------------------------------------
+        private void ThemeTile_Click(object? sender, EventArgs e)
+        {
+            theme = theme.IsDark ? Theme.Light : Theme.Dark;
+            ApplyTheme();
+            SaveSettings();
+        }
+
+        //-------------------------------------------------------------------------------
+        // ON/OFF型タイルの表示を更新する処理
+        //-------------------------------------------------------------------------------
+        private void RefreshToggleTiles()
+        {
+            sidewaysTile.IsOn = joyConSidewaysStick;
+            sidewaysTile.Subtitle = joyConSidewaysStick ? "On" : "Off";
+            inputLogTile.IsOn = enableInputLog;
+            inputLogTile.Subtitle = enableInputLog ? "On" : "Off";
+        }
+
+        //-------------------------------------------------------------------------------
+        // ログ見出し押下時に表示／折りたたみを切り替える処理
+        //-------------------------------------------------------------------------------
+        private void LogHeader_Click(object? sender, EventArgs e)
+        {
+            isLogCollapsed = !isLogCollapsed;
+            ApplyLogCollapsedState();
+            SaveSettings();
+        }
+
+        //-------------------------------------------------------------------------------
+        // ログの折りたたみ状態を画面へ反映する処理
+        //-------------------------------------------------------------------------------
+        private void ApplyLogCollapsedState()
+        {
+            logTextBox.Visible = !isLogCollapsed;
+            logChevronLabel.Text = isLogCollapsed ? Glyphs.ChevronUp : Glyphs.ChevronDown;
+            rootLayout.RowStyles[3].Height = isLogCollapsed ? S(54) : S(170);
+            RefreshToggleTiles();
         }
 
         //-------------------------------------------------------------------------------
@@ -496,83 +784,226 @@ namespace Sad2Key
         private void LoadJoyToKeyProfile(string filePath)
         {
             keyMappings.Clear();
+            ClearPreservedProfileLines();
+            var currentSection = preservedHeaderLines;
+            var hasUnsupportedMultiMode = false;
 
-            foreach (var line in File.ReadLines(filePath, Encoding.UTF8))
+            try
             {
-                var trimmedLine = line.Trim();
-
-                if (trimmedLine.Length == 0 || trimmedLine.StartsWith("[") || !trimmedLine.Contains('='))
+                foreach (var line in File.ReadLines(filePath, Encoding.UTF8))
                 {
-                    continue;
-                }
+                    var trimmedLine = line.Trim();
 
-                var splitIndex = trimmedLine.IndexOf('=');
-                var inputName = trimmedLine[..splitIndex].Trim();
-                var settingValue = trimmedLine[(splitIndex + 1)..].Trim();
+                    if (trimmedLine.StartsWith('['))
+                    {
+                        currentSection = trimmedLine.Equals(Joystick1SectionName, StringComparison.OrdinalIgnoreCase)
+                            ? preservedJoystickLines
+                            : currentSection == preservedJoystickLines ? preservedTrailingLines : currentSection;   // [Joystick 1]の後は末尾扱い
 
-                if (!TryParseJoyToKeyKeys(settingValue, out var keys))
-                {
-                    continue;
-                }
+                        if (currentSection != preservedJoystickLines)
+                        {
+                            currentSection.Add(line);
+                        }
 
-                foreach (var mappedInputName in ConvertJoyToKeyInputNames(inputName))
-                {
-                    keyMappings[mappedInputName] = keys;
+                        continue;
+                    }
+
+                    currentSection.Add(line);
+
+                    if (currentSection != preservedJoystickLines || !TrySplitProfileLine(trimmedLine, out var inputName, out var settingValue))
+                    {
+                        continue;
+                    }
+
+                    var mappedInputNames = ConvertJoyToKeyInputNames(inputName).ToArray();
+
+                    if (mappedInputNames.Length == 0 || !KeyMapping.TryParseJoyToKeyValue(settingValue, out var mapping))
+                    {
+                        continue;                                           // 管理対象外の行は原文保持のみ
+                    }
+
+                    hasUnsupportedMultiMode |= mapping.Kind == MappingKind.MultiKeyOther;
+
+                    foreach (var mappedInputName in mappedInputNames)
+                    {
+                        keyMappings[mappedInputName] = mapping;
+                    }
                 }
             }
+            catch (Exception exception)
+            {
+                AppendLog($"Profile could not be read: {exception.Message}");
+            }
 
-            AddEditableMappingRows();
+            if (hasUnsupportedMultiMode)
+            {
+                AppendLog("Unsupported multi-key mode found: only input 1 is used while pressed");
+            }
+
+            AddEditableMappingRows(true);
             RefreshMappingView();
             AppendLog($"Loaded profile: {filePath}");
         }
 
         //-------------------------------------------------------------------------------
-        // UI編集用の基本入力行を追加する処理
+        // cfgの「名前=値」行を名前と値に分割する処理
         //-------------------------------------------------------------------------------
-        private void AddEditableMappingRows()
+        private static bool TrySplitProfileLine(string trimmedLine, out string inputName, out string settingValue)
         {
-            keyMappings.TryAdd("SwitchDPadUp", []);
-            keyMappings.TryAdd("SwitchDPadRight", []);
-            keyMappings.TryAdd("SwitchDPadDown", []);
-            keyMappings.TryAdd("SwitchDPadLeft", []);
-            keyMappings.TryAdd("SwitchAxisUp", []);
-            keyMappings.TryAdd("SwitchAxisRight", []);
-            keyMappings.TryAdd("SwitchAxisDown", []);
-            keyMappings.TryAdd("SwitchAxisLeft", []);
-            keyMappings.TryAdd("SwitchRightAxisUp", []);
-            keyMappings.TryAdd("SwitchRightAxisRight", []);
-            keyMappings.TryAdd("SwitchRightAxisDown", []);
-            keyMappings.TryAdd("SwitchRightAxisLeft", []);
+            inputName = string.Empty;
+            settingValue = string.Empty;
+            var splitIndex = trimmedLine.IndexOf('=');
 
-            for (var buttonNumber = 1; buttonNumber <= 16; buttonNumber++)
+            if (trimmedLine.Length == 0 || splitIndex <= 0)
             {
-                keyMappings.TryAdd($"Button{buttonNumber:D2}", []);
+                return false;
             }
+
+            inputName = trimmedLine[..splitIndex].Trim();
+            settingValue = trimmedLine[(splitIndex + 1)..].Trim();
+            return true;
         }
 
         //-------------------------------------------------------------------------------
-        // keymap.jsonへマッピングを保存する処理
+        // 保存時の原文保持用に記憶したcfgの行を破棄する処理
+        //-------------------------------------------------------------------------------
+        private void ClearPreservedProfileLines()
+        {
+            preservedHeaderLines.Clear();
+            preservedJoystickLines.Clear();
+            preservedTrailingLines.Clear();
+        }
+
+        //-------------------------------------------------------------------------------
+        // UI編集用の基本入力行を追加する処理（cfg用はJoyToKey互換名，json用はSwitch名）
+        //-------------------------------------------------------------------------------
+        private void AddEditableMappingRows(bool forJoyToKeyProfile)
+        {
+            if (forJoyToKeyProfile)
+            {
+                keyMappings.TryAdd("PovUp", KeyMapping.CreateHold([]));
+                keyMappings.TryAdd("PovRight", KeyMapping.CreateHold([]));
+                keyMappings.TryAdd("PovDown", KeyMapping.CreateHold([]));
+                keyMappings.TryAdd("PovLeft", KeyMapping.CreateHold([]));
+
+                for (var buttonNumber = 1; buttonNumber <= 16; buttonNumber++)
+                {
+                    keyMappings.TryAdd($"Button{buttonNumber:D2}", KeyMapping.CreateHold([]));
+                }
+
+                return;
+            }
+
+            keyMappings.TryAdd("SwitchDPadUp", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchDPadRight", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchDPadDown", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchDPadLeft", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchAxisUp", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchAxisRight", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchAxisDown", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchAxisLeft", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchRightAxisUp", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchRightAxisRight", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchRightAxisDown", KeyMapping.CreateHold([]));
+            keyMappings.TryAdd("SwitchRightAxisLeft", KeyMapping.CreateHold([]));
+        }
+
+        //-------------------------------------------------------------------------------
+        // keymap.jsonへマッピングを保存する処理（押しっぱなし型のみ対応）
         //-------------------------------------------------------------------------------
         private void SaveJsonProfile()
         {
             var config = keyMappings
-                .Where(x => x.Value.Count > 0)
-                .ToDictionary(x => x.Key, x => string.Join("+", x.Value.Select(ConvertKeyToConfigName)));
+                .Where(x => x.Value.Kind == MappingKind.Hold && x.Value.Keys.Count > 0)
+                .ToDictionary(x => x.Key, x => string.Join("+", x.Value.Keys.Select(ConvertKeyToConfigName)));
 
-            Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
-            File.WriteAllText(configPath, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
+            try
+            {
+                File.WriteAllText(configPath, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
+            }
+            catch (Exception exception)
+            {
+                AppendLog($"keymap.json could not be saved: {exception.Message}");
+            }
         }
 
         //-------------------------------------------------------------------------------
         // JoyToKey形式cfgへマッピングを保存する処理
+        // 読み込み時に記憶した原文を土台にし，管理対象の行だけを現在の割り当てで置き換える
         //-------------------------------------------------------------------------------
         private void SaveJoyToKeyProfile(string filePath)
         {
-            var lines = new List<string>
+            var lines = new List<string>();
+
+            if (preservedHeaderLines.Count > 0)
             {
+                lines.AddRange(preservedHeaderLines);
+            }
+            else
+            {
+                lines.AddRange(CreateDefaultProfileHeaderLines());
+            }
+
+            lines.Add(Joystick1SectionName);
+            var writtenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var preservedLine in preservedJoystickLines)
+            {
+                if (!TrySplitProfileLine(preservedLine.Trim(), out var joyToKeyName, out _)
+                    || !TryConvertJoyToKeyNameToInputName(joyToKeyName, out var inputName))
+                {
+                    lines.Add(preservedLine);                               // 管理対象外の行は原文のまま残す
+                    continue;
+                }
+
+                if (writtenNames.Contains(joyToKeyName))
+                {
+                    continue;                                               // 重複行は最初の1つだけ残す
+                }
+
+                writtenNames.Add(joyToKeyName);
+
+                if (keyMappings.TryGetValue(inputName, out var mapping) && !mapping.IsEmpty)
+                {
+                    lines.Add($"{joyToKeyName}={mapping.ToJoyToKeyValue()}");
+                }
+            }
+
+            foreach (var pair in keyMappings.OrderBy(x => x.Key))
+            {
+                if (pair.Value.IsEmpty
+                    || !TryConvertInputNameToJoyToKeyName(pair.Key, out var joyToKeyName)
+                    || writtenNames.Contains(joyToKeyName))
+                {
+                    continue;
+                }
+
+                writtenNames.Add(joyToKeyName);
+                lines.Add($"{joyToKeyName}={pair.Value.ToJoyToKeyValue()}");
+            }
+
+            lines.AddRange(preservedTrailingLines);
+
+            try
+            {
+                File.WriteAllLines(filePath, lines, Encoding.UTF8);
+            }
+            catch (Exception exception)
+            {
+                AppendLog($"Profile could not be saved: {exception.Message}");
+            }
+        }
+
+        //-------------------------------------------------------------------------------
+        // 新規cfg用の[General]セクション行を作成する処理
+        //-------------------------------------------------------------------------------
+        private static List<string> CreateDefaultProfileHeaderLines()
+        {
+            return
+            [
                 "[General]",
                 "FileVersion=61",
-                "NumberOfJoysticks=2",
+                "NumberOfJoysticks=1",
                 "NumberOfButtons=32",
                 "DisplayMode=2",
                 "UseDiagonalInput=0",
@@ -584,20 +1015,16 @@ namespace Sad2Key
                 "SoundFile=",
                 "ImageFile=",
                 string.Empty,
-                "[Joystick 1]",
-            };
+            ];
+        }
 
-            foreach (var mapping in keyMappings.OrderBy(x => x.Key))
-            {
-                if (mapping.Value.Count == 0 || !TryConvertInputNameToJoyToKeyName(mapping.Key, out var joyToKeyName))
-                {
-                    continue;
-                }
-
-                lines.Add($"{joyToKeyName}=1, {ConvertKeysToJoyToKeyCode(mapping.Value)}, 0.000, 0, 0");
-            }
-
-            File.WriteAllLines(filePath, lines, Encoding.UTF8);
+        //-------------------------------------------------------------------------------
+        // JoyToKey入力名を一覧表示用の入力名へ変換する処理（保存時の照合用）
+        //-------------------------------------------------------------------------------
+        private static bool TryConvertJoyToKeyNameToInputName(string joyToKeyName, out string inputName)
+        {
+            inputName = ConvertJoyToKeyInputNames(joyToKeyName).FirstOrDefault() ?? string.Empty;
+            return inputName.Length > 0;
         }
 
         //-------------------------------------------------------------------------------
@@ -627,7 +1054,8 @@ namespace Sad2Key
                 return true;
             }
 
-            if (inputName.StartsWith("Button", StringComparison.OrdinalIgnoreCase)
+            if (inputName.Length == 8                                      // 「Button01」形式（2桁）だけを保存対象にする
+                && inputName.StartsWith("Button", StringComparison.OrdinalIgnoreCase)
                 && int.TryParse(inputName[6..], out var buttonNumber))
             {
                 joyToKeyName = $"Button{buttonNumber:D2}";
@@ -635,53 +1063,6 @@ namespace Sad2Key
             }
 
             return false;
-        }
-
-        //-------------------------------------------------------------------------------
-        // キー一覧をJoyToKeyのキーコード文字列へ変換する処理
-        //-------------------------------------------------------------------------------
-        private static string ConvertKeysToJoyToKeyCode(List<Keys> keys)
-        {
-            var keyCodes = keys
-                .Take(4)
-                .Select(x => ((int)x).ToString("X2"))
-                .ToList();
-
-            while (keyCodes.Count < 4)
-            {
-                keyCodes.Add("00");
-            }
-
-            return string.Join(":", keyCodes);
-        }
-
-        //-------------------------------------------------------------------------------
-        // JoyToKeyのキー設定値をキーコードへ変換する処理
-        //-------------------------------------------------------------------------------
-        private static bool TryParseJoyToKeyKeys(string settingValue, out List<Keys> keys)
-        {
-            keys = [];
-            var parts = settingValue.Split(',', StringSplitOptions.TrimEntries);
-
-            if (parts.Length < 2 || parts[0] != "1")
-            {
-                return false;
-            }
-
-            var keyCodes = parts[1].Split(':');
-
-            foreach (var keyCode in keyCodes)
-            {
-                if (!int.TryParse(keyCode, System.Globalization.NumberStyles.HexNumber, null, out var virtualKey)
-                    || virtualKey == 0)
-                {
-                    continue;
-                }
-
-                keys.Add((Keys)virtualKey);
-            }
-
-            return keys.Count > 0;
         }
 
         //-------------------------------------------------------------------------------
@@ -717,48 +1098,19 @@ namespace Sad2Key
         //-------------------------------------------------------------------------------
         private static IEnumerable<string> ConvertJoyToKeyPovInputNames(string inputName)
         {
+            // POVはコントローラー側でJoyToKey互換名（Pov*）として出すため，Switch名へは二重登録しない
             var inputNames = inputName.ToUpperInvariant() switch
             {
-                "POV1-1" => ["SwitchDPadUp", "PovUp"],
-                "POV1-3" => ["SwitchDPadRight", "PovRight"],
-                "POV1-5" => ["SwitchDPadDown", "PovDown"],
-                "POV1-7" => ["SwitchDPadLeft", "PovLeft"],
+                "POV1-1" => ["PovUp"],
+                "POV1-3" => ["PovRight"],
+                "POV1-5" => ["PovDown"],
+                "POV1-7" => ["PovLeft"],
                 _ => Array.Empty<string>(),
             };
 
             foreach (var sad2KeyInputName in inputNames)
             {
                 yield return sad2KeyInputName;
-            }
-        }
-
-        //-------------------------------------------------------------------------------
-        // JoyToKeyのボタン番号をSwitch入力名へ変換する処理
-        //-------------------------------------------------------------------------------
-        private static IEnumerable<string> ConvertJoyToKeyButtonToSwitchInputs(int buttonNumber)
-        {
-            var inputNames = buttonNumber switch
-            {
-                1 => ["SwitchB"],
-                2 => ["SwitchA"],
-                3 => ["SwitchY"],
-                4 => ["SwitchX"],
-                5 => ["SwitchL"],
-                6 => ["SwitchR"],
-                7 => ["SwitchZL"],
-                8 => ["SwitchZR"],
-                9 => ["SwitchMinus"],
-                10 => ["SwitchPlus"],
-                11 => ["SwitchStick"],
-                12 => ["SwitchRightStick"],
-                13 => ["SwitchHome"],
-                14 => ["SwitchCapture"],
-                _ => Array.Empty<string>(),
-            };
-
-            foreach (var inputName in inputNames)
-            {
-                yield return inputName;
             }
         }
 
@@ -855,16 +1207,64 @@ namespace Sad2Key
         //-------------------------------------------------------------------------------
         private void RefreshMappingView()
         {
+            stateListView.BeginUpdate();
             stateListView.Items.Clear();
             lastDisplayedInputs.Clear();
 
             foreach (var mapping in keyMappings.OrderBy(x => x.Key))
             {
-                var item = new ListViewItem(mapping.Key);
-                item.SubItems.Add(string.Join(" + ", mapping.Value));
-                item.SubItems.Add(string.Empty);
+                if (IsHiddenAliasRow(mapping.Key))
+                {
+                    continue;
+                }
+
+                var item = new ListViewItem(mapping.Key)
+                {
+                    BackColor = theme.Surface,
+                    ForeColor = theme.Text,
+                };
+                item.SubItems.Add(mapping.Value.IsEmpty ? string.Empty : mapping.Value.Describe());
                 stateListView.Items.Add(item);
             }
+
+            stateListView.EndUpdate();
+        }
+
+        //-------------------------------------------------------------------------------
+        // テーマ変更時に一覧の行色を現在のテーマで塗り直す処理
+        //-------------------------------------------------------------------------------
+        private void RepaintStateRows()
+        {
+            var pressedInputs = lastDisplayedInputs;
+            lastDisplayedInputs = [];
+
+            foreach (ListViewItem item in stateListView.Items)
+            {
+                var isPressed = pressedInputs.Contains(item.Text);
+                item.BackColor = isPressed ? theme.Accent : theme.Surface;
+                item.ForeColor = isPressed ? theme.OnAccent : theme.Text;
+            }
+
+            lastDisplayedInputs = pressedInputs;
+            stateListView.Invalidate();
+        }
+
+        //-------------------------------------------------------------------------------
+        // ButtonNN行がある場合にButtonN / RawButtonNの別名行を一覧から隠すか判定する処理
+        //-------------------------------------------------------------------------------
+        private bool IsHiddenAliasRow(string inputName)
+        {
+            var numberText = inputName.StartsWith("RawButton", StringComparison.Ordinal)
+                ? inputName[9..]
+                : inputName.StartsWith("Button", StringComparison.Ordinal) ? inputName[6..] : string.Empty;
+
+            if (numberText.Length == 0 || !int.TryParse(numberText, out var buttonNumber))
+            {
+                return false;
+            }
+
+            var canonicalName = $"Button{buttonNumber:D2}";
+            return inputName != canonicalName && keyMappings.ContainsKey(canonicalName);
         }
 
         //-------------------------------------------------------------------------------
@@ -877,18 +1277,33 @@ namespace Sad2Key
                 return;
             }
 
+            if (pollingTask is not null)
+            {
+                AppendLog("Stop mapping before editing");                   // 監視スレッドと割り当て辞書の競合を避ける
+                return;
+            }
+
             var item = stateListView.SelectedItems[0];
             var inputName = item.Text;
-            keyMappings.TryGetValue(inputName, out var currentKeys);
+            keyMappings.TryGetValue(inputName, out var currentMapping);
 
-            using var dialog = new MappingEditDialog(inputName, currentKeys ?? []);
+            using var dialog = new MappingEditDialog(inputName, currentMapping ?? KeyMapping.CreateHold([]), theme);
 
             if (dialog.ShowDialog(this) != DialogResult.OK)
             {
                 return;
             }
 
-            keyMappings[inputName] = dialog.SelectedKeys;
+            keyMappings[inputName] = dialog.Result;
+
+            if (TryConvertInputNameToJoyToKeyName(inputName, out var joyToKeyName))
+            {
+                foreach (var aliasInputName in ConvertJoyToKeyInputNames(joyToKeyName))
+                {
+                    keyMappings[aliasInputName] = dialog.Result;            // ButtonN / RawButtonN などの別名にも同じ割り当てを反映する
+                }
+            }
+
             RefreshMappingView();
             SelectMappingRow(inputName);
         }
@@ -918,30 +1333,24 @@ namespace Sad2Key
         {
             DisposeSwitchHidControllers();
             devices.Clear();
-            deviceComboBox.Items.Clear();
-            deviceComboBox.Items.Add(DeviceInfo.AllDevices);
+            devices.Add(DeviceInfo.AllDevices);
 
             foreach (var switchHidController in SwitchHidController.Enumerate())
             {
+                switchHidController.SidewaysStick = joyConSidewaysStick;
                 switchHidControllers.Add(switchHidController);
-                var device = new DeviceInfo(InputSource.SwitchHid, 0, switchHidController.Name, null, null, switchHidController);
-                devices.Add(device);
-                deviceComboBox.Items.Add(device);
+                devices.Add(new DeviceInfo(InputSource.SwitchHid, 0, switchHidController.Name, null, null, switchHidController));
             }
 
             foreach (var gamepad in Gamepad.Gamepads)
             {
-                var device = new DeviceInfo(InputSource.WindowsGamingInput, 0, "Windows Gaming Gamepad", gamepad, null, null);
-                devices.Add(device);
-                deviceComboBox.Items.Add(device);
+                devices.Add(new DeviceInfo(InputSource.WindowsGamingInput, 0, "Windows Gaming Gamepad", gamepad, null, null));
             }
 
             foreach (var rawController in RawGameController.RawGameControllers)
             {
                 var name = string.IsNullOrWhiteSpace(rawController.DisplayName) ? "Raw Game Controller" : rawController.DisplayName;
-                var device = new DeviceInfo(InputSource.RawGameController, 0, name, null, rawController, null);
-                devices.Add(device);
-                deviceComboBox.Items.Add(device);
+                devices.Add(new DeviceInfo(InputSource.RawGameController, 0, name, null, rawController, null));
             }
 
             for (uint deviceId = 0; deviceId < MaxDevices; deviceId++)
@@ -952,23 +1361,17 @@ namespace Sad2Key
                 if (result == 0 && TryGetJoyInfo(deviceId, out _))
                 {
                     var name = string.IsNullOrWhiteSpace(caps.ProductName) ? $"Controller {deviceId}" : caps.ProductName;
-                    var device = new DeviceInfo(InputSource.WinMm, deviceId, name, null, null, null);
-                    devices.Add(device);
-                    deviceComboBox.Items.Add(device);
+                    devices.Add(new DeviceInfo(InputSource.WinMm, deviceId, name, null, null, null));
                 }
             }
 
-            if (deviceComboBox.Items.Count > 0)
-            {
-                deviceComboBox.SelectedIndex = 0;
-                startButton.Enabled = true;
-                statusLabel.Text = $"{deviceComboBox.Items.Count - 1} controller(s) found";
-            }
-            else
-            {
-                startButton.Enabled = false;
-                statusLabel.Text = "No controller found";
-            }
+            // Switch HID経路があればそれを既定にし，無ければ先頭（All）を選ぶ
+            var preferredDevice = devices.FirstOrDefault(x => x.Source == InputSource.SwitchHid)
+                ?? devices.FirstOrDefault(x => x.Source != InputSource.All)
+                ?? devices.FirstOrDefault();
+            SelectDevice(preferredDevice);
+            powerButton.Enabled = devices.Count > 1;
+            UpdateStatusTile();
         }
 
         //-------------------------------------------------------------------------------
@@ -1005,68 +1408,46 @@ namespace Sad2Key
         }
 
         //-------------------------------------------------------------------------------
-        // Refreshボタン押下時にコントローラーを再検出する処理
+        // 電源ボタン押下時にキー変換を開始／停止する処理
         //-------------------------------------------------------------------------------
-        private void RefreshButton_Click(object? sender, EventArgs e)
+        private void PowerButton_Click(object? sender, EventArgs e)
         {
-            StopMapping();
-            RefreshDevices();
+            if (pollingTask is not null)
+            {
+                StopMapping();
+                return;
+            }
+
+            StartMapping();
         }
 
         //-------------------------------------------------------------------------------
-        // Startボタン押下時にキー変換を開始する処理
+        // キー変換を開始する処理
         //-------------------------------------------------------------------------------
-        private void StartButton_Click(object? sender, EventArgs e)
+        private void StartMapping()
         {
-            if (deviceComboBox.SelectedItem is not DeviceInfo)
+            if (selectedDevice is null || selectedDevice.Source == InputSource.All && devices.Count <= 1)
             {
                 AppendLog("Controller is not selected");
                 return;
             }
 
-            lock (inputLock)
-            {
-                activeInputs.Clear();
-            }
-
-            activeDevice = (DeviceInfo)deviceComboBox.SelectedItem;
+            inputEngine.ReleaseAll();
+            inputEngine.EnableLog = enableInputLog;
+            activeDevice = selectedDevice;
             pollingCancellationTokenSource = new CancellationTokenSource();
             pollingTask = Task.Run(() => PollInputLoop(pollingCancellationTokenSource.Token));
-            startButton.Enabled = false;
-            stopButton.Enabled = true;
-            refreshButton.Enabled = false;
-            profileListBox.Enabled = false;
-            profileRefreshButton.Enabled = false;
-            profileNewButton.Enabled = false;
-            profileSaveButton.Enabled = false;
-            profileFolderButton.Enabled = false;
             focusSinkTextBox.Focus();
-            statusLabel.Text = "Mapping started";
+            UpdateStatusTile();
+            AppendLog($"Mapping started: {activeDevice}");
         }
 
         //-------------------------------------------------------------------------------
-        // Stopボタン押下時にキー変換を停止する処理
+        // Test keyタイル押下時にキー送信だけを確認する処理
         //-------------------------------------------------------------------------------
-        private void StopButton_Click(object? sender, EventArgs e)
+        private void TestKeyTile_Click(object? sender, EventArgs e)
         {
-            StopMapping();
-        }
-
-        //-------------------------------------------------------------------------------
-        // 入力ログ出力設定を変更する処理
-        //-------------------------------------------------------------------------------
-        private void InputLogCheckBox_CheckedChanged(object? sender, EventArgs e)
-        {
-            enableInputLog = inputLogCheckBox.Checked;
-        }
-
-        //-------------------------------------------------------------------------------
-        // Test Keyボタン押下時にキー送信だけを確認する処理
-        //-------------------------------------------------------------------------------
-        private void TestKeyButton_Click(object? sender, EventArgs e)
-        {
-            SendKeyboardInput(Keys.A, false, AppendLog);
-            SendKeyboardInput(Keys.A, true, AppendLog);
+            keySender.SendTap(Keys.A);
             AppendLog("TestKey -> A");
         }
 
@@ -1077,6 +1458,7 @@ namespace Sad2Key
         {
             StopMapping();
             DisposeSwitchHidControllers();
+            SaveSettings();
         }
 
         //-------------------------------------------------------------------------------
@@ -1084,32 +1466,20 @@ namespace Sad2Key
         //-------------------------------------------------------------------------------
         private void StopMapping()
         {
+            var wasRunning = pollingTask is not null;
             pollingCancellationTokenSource?.Cancel();
             pollingTask?.Wait(300);
             pollingCancellationTokenSource?.Dispose();
             pollingCancellationTokenSource = null;
             pollingTask = null;
-
-            lock (inputLock)
-            {
-                foreach (var inputName in activeInputs.ToArray())
-                {
-                    ReleaseMappedInput(inputName);
-                }
-
-                activeInputs.Clear();
-            }
-
+            inputEngine.ReleaseAll();
             activeDevice = null;
-            startButton.Enabled = deviceComboBox.Items.Count > 0;
-            stopButton.Enabled = false;
-            refreshButton.Enabled = true;
-            profileListBox.Enabled = true;
-            profileRefreshButton.Enabled = true;
-            profileNewButton.Enabled = true;
-            profileSaveButton.Enabled = true;
-            profileFolderButton.Enabled = true;
-            statusLabel.Text = "Mapping stopped";
+            UpdateStatusTile();
+
+            if (wasRunning)
+            {
+                AppendLog("Mapping stopped");
+            }
         }
 
         //-------------------------------------------------------------------------------
@@ -1137,19 +1507,7 @@ namespace Sad2Key
                     return;
                 }
 
-                lock (inputLock)
-                {
-                    foreach (var inputName in currentInputs)
-                    {
-                        PressMappedInput(inputName);
-                    }
-
-                    foreach (var inputName in activeInputs.Except(currentInputs).ToArray())
-                    {
-                        ReleaseMappedInput(inputName);
-                    }
-                }
-
+                inputEngine.Update(currentInputs, Environment.TickCount64);   // 長押し判定とタップ解除もここで進む
                 QueueStateViewUpdate(currentInputs);
 
                 if (device.Source == InputSource.SwitchHid)
@@ -1181,7 +1539,7 @@ namespace Sad2Key
 
                 foreach (var currentDevice in allDevices)
                 {
-                    if (!TryGetPressedInputs(currentDevice, allDevices, out var currentInputs))
+                    if (currentDevice.Source == InputSource.All || !TryGetPressedInputs(currentDevice, allDevices, out var currentInputs))
                     {
                         continue;
                     }
@@ -1465,93 +1823,7 @@ namespace Sad2Key
         }
 
         //-------------------------------------------------------------------------------
-        // 割り当てられたキーを押下する処理
-        //-------------------------------------------------------------------------------
-        private void PressMappedInput(string inputName)
-        {
-            if (activeInputs.Contains(inputName) || !keyMappings.TryGetValue(inputName, out var keys) || keys.Count == 0)
-            {
-                return;
-            }
-
-            foreach (var key in keys)
-            {
-                SendKeyboardInput(key, false, AppendLog);
-            }
-
-            activeInputs.Add(inputName);
-
-            if (enableInputLog)
-            {
-                AppendLog($"{inputName} -> {string.Join(" + ", keys)} Down");
-            }
-        }
-
-        //-------------------------------------------------------------------------------
-        // 割り当てられたキーを解除する処理
-        //-------------------------------------------------------------------------------
-        private void ReleaseMappedInput(string inputName)
-        {
-            if (!activeInputs.Contains(inputName) || !keyMappings.TryGetValue(inputName, out var keys))
-            {
-                return;
-            }
-
-            foreach (var key in keys.AsEnumerable().Reverse())
-            {
-                SendKeyboardInput(key, true, AppendLog);
-            }
-
-            activeInputs.Remove(inputName);
-
-            if (enableInputLog)
-            {
-                AppendLog($"{inputName} -> {string.Join(" + ", keys)} Up");
-            }
-        }
-
-        //-------------------------------------------------------------------------------
-        // SendInputでキーボード入力を送信する処理
-        //-------------------------------------------------------------------------------
-        private static void SendKeyboardInput(Keys key, bool keyUp, Action<string>? logAction = null)
-        {
-            var input = new Input
-            {
-                Type = InputKeyboard,
-                Data = new InputUnion
-                {
-                    Keyboard = new KeyboardInput
-                    {
-                        VirtualKey = (ushort)key,
-                        Scan = 0,
-                        Flags = GetExtendedKeyFlag(key) | (keyUp ? KeyEventFKeyUp : 0),
-                    },
-                },
-            };
-
-            var inputSize = Marshal.SizeOf<Input>();
-            var sentCount = SendInput(1, [input], inputSize);
-
-            if (sentCount == 0)
-            {
-                logAction?.Invoke($"SendInput failed: key={key}, size={inputSize}, error={Marshal.GetLastWin32Error()}");
-            }
-        }
-
-        //-------------------------------------------------------------------------------
-        // 拡張キー用の送信フラグを取得する処理
-        //-------------------------------------------------------------------------------
-        private static uint GetExtendedKeyFlag(Keys key)
-        {
-            return key is Keys.Up or Keys.Down or Keys.Left or Keys.Right
-                or Keys.Insert or Keys.Delete or Keys.Home or Keys.End
-                or Keys.PageUp or Keys.PageDown or Keys.RControlKey or Keys.RMenu
-                ? KeyEventFExtendedKey
-                : 0;
-        }
-
-        //-------------------------------------------------------------------------------
-        // 入力状態一覧を更新する処理
+        // 入力状態一覧を更新する処理（押下中の行をアクセント色にする）
         //-------------------------------------------------------------------------------
         private void UpdateStateView(HashSet<string> currentInputs)
         {
@@ -1571,15 +1843,14 @@ namespace Sad2Key
 
                 var item = new ListViewItem(inputName);
                 item.SubItems.Add("-");
-                item.SubItems.Add(string.Empty);
                 stateListView.Items.Add(item);
             }
 
             foreach (ListViewItem item in stateListView.Items)
             {
                 var isPressed = currentInputs.Contains(item.Text);
-                item.BackColor = isPressed ? Color.Khaki : SystemColors.Window;
-                item.ForeColor = SystemColors.WindowText;
+                item.BackColor = isPressed ? theme.Accent : theme.Surface;
+                item.ForeColor = isPressed ? theme.OnAccent : theme.Text;
             }
 
             lastDisplayedInputs = currentInputs.ToHashSet();
@@ -1646,12 +1917,6 @@ namespace Sad2Key
         [DllImport("winmm.dll", EntryPoint = "joyGetPosEx")]
         private static extern uint JoyGetPosEx(uint deviceId, ref JoyInfoEx joyInfo);
 
-        //-------------------------------------------------------------------------------
-        // キーボード入力を送信するWindows API
-        //-------------------------------------------------------------------------------
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint SendInput(uint numberOfInputs, Input[] inputs, int inputSize);
-
         private sealed record DeviceInfo(InputSource Source, uint Id, string Name, Gamepad? Gamepad, RawGameController? RawGameController, SwitchHidController? SwitchHidController)
         {
             public static readonly DeviceInfo AllDevices = new(InputSource.All, 0, "All detected controllers", null, null, null);
@@ -1682,11 +1947,11 @@ namespace Sad2Key
             WinMm,
         }
 
-        private sealed record AppSettings(string ProfileDirectory);
+        private sealed record AppSettings(string ProfileDirectory, bool JoyConSidewaysStick = true, string Theme = "Dark", bool LogCollapsed = false);
 
         private sealed record ProfileInfo(string Name, string Path, bool IsJsonDefault)
         {
-            public static readonly ProfileInfo JsonDefault = new("keymap.json", string.Empty, true);
+            public static readonly ProfileInfo JsonDefault = new(JsonProfileFileName, string.Empty, true);
 
             //-------------------------------------------------------------------------------
             // プロファイル表示名を返す処理
@@ -1694,250 +1959,6 @@ namespace Sad2Key
             public override string ToString()
             {
                 return Name;
-            }
-        }
-
-        private sealed class MappingEditDialog : Form
-        {
-            private readonly Label keyLabel;
-            private readonly Button okButton;
-            private readonly Button clearButton;
-
-            public List<Keys> SelectedKeys { get; private set; }
-
-            //-------------------------------------------------------------------------------
-            // キー割り当て編集画面を初期化する処理
-            //-------------------------------------------------------------------------------
-            public MappingEditDialog(string inputName, List<Keys> currentKeys)
-            {
-                Text = $"Edit {inputName}";
-                FormBorderStyle = FormBorderStyle.FixedDialog;
-                StartPosition = FormStartPosition.CenterParent;
-                MaximizeBox = false;
-                MinimizeBox = false;
-                ClientSize = new Size(360, 150);
-                KeyPreview = true;
-                SelectedKeys = currentKeys.ToList();
-
-                var titleLabel = new Label
-                {
-                    Text = inputName,
-                    Dock = DockStyle.Top,
-                    Height = 32,
-                    TextAlign = ContentAlignment.MiddleLeft,
-                    Padding = new Padding(12, 0, 0, 0),
-                };
-                Controls.Add(titleLabel);
-
-                keyLabel = new Label
-                {
-                    Dock = DockStyle.Top,
-                    Height = 48,
-                    BorderStyle = BorderStyle.FixedSingle,
-                    TextAlign = ContentAlignment.MiddleCenter,
-                };
-                Controls.Add(keyLabel);
-
-                var buttonLayout = new FlowLayoutPanel
-                {
-                    Dock = DockStyle.Bottom,
-                    FlowDirection = FlowDirection.RightToLeft,
-                    Height = 44,
-                    Padding = new Padding(8),
-                };
-                Controls.Add(buttonLayout);
-
-                okButton = new Button
-                {
-                    Text = "OK",
-                    DialogResult = DialogResult.OK,
-                    Width = 80,
-                };
-                buttonLayout.Controls.Add(okButton);
-
-                var cancelButton = new Button
-                {
-                    Text = "Cancel",
-                    DialogResult = DialogResult.Cancel,
-                    Width = 80,
-                };
-                buttonLayout.Controls.Add(cancelButton);
-
-                clearButton = new Button
-                {
-                    Text = "Clear",
-                    Width = 80,
-                };
-                clearButton.Click += ClearButton_Click;
-                buttonLayout.Controls.Add(clearButton);
-
-                AcceptButton = okButton;
-                CancelButton = cancelButton;
-                KeyDown += MappingEditDialog_KeyDown;
-                RefreshKeyLabel();
-            }
-
-            //-------------------------------------------------------------------------------
-            // Clearボタン押下時にキー割り当てを削除する処理
-            //-------------------------------------------------------------------------------
-            private void ClearButton_Click(object? sender, EventArgs e)
-            {
-                SelectedKeys.Clear();
-                RefreshKeyLabel();
-            }
-
-            //-------------------------------------------------------------------------------
-            // キー押下時に割り当てキーを取り込む処理
-            //-------------------------------------------------------------------------------
-            private void MappingEditDialog_KeyDown(object? sender, KeyEventArgs e)
-            {
-                if (e.KeyCode is Keys.Enter or Keys.Escape)
-                {
-                    return;
-                }
-
-                var keys = new List<Keys>();
-
-                if (e.Control)
-                {
-                    keys.Add(Keys.ControlKey);
-                }
-
-                if (e.Shift)
-                {
-                    keys.Add(Keys.ShiftKey);
-                }
-
-                if (e.Alt)
-                {
-                    keys.Add(Keys.Menu);
-                }
-
-                if (e.KeyCode is not Keys.ControlKey and not Keys.ShiftKey and not Keys.Menu)
-                {
-                    keys.Add(e.KeyCode);
-                }
-
-                SelectedKeys = keys.Distinct().Take(4).ToList();
-                RefreshKeyLabel();
-                e.SuppressKeyPress = true;
-                e.Handled = true;
-            }
-
-            //-------------------------------------------------------------------------------
-            // 割り当てキー表示を更新する処理
-            //-------------------------------------------------------------------------------
-            private void RefreshKeyLabel()
-            {
-                keyLabel.Text = SelectedKeys.Count == 0
-                    ? "No key assigned"
-                    : string.Join(" + ", SelectedKeys);
-            }
-        }
-
-        private sealed class ProfileNameDialog : Form
-        {
-            private readonly TextBox profileNameTextBox;
-
-            public string ProfileName => SanitizeProfileName(profileNameTextBox.Text);
-
-            //-------------------------------------------------------------------------------
-            // プロファイル名入力画面を初期化する処理
-            //-------------------------------------------------------------------------------
-            public ProfileNameDialog()
-            {
-                Text = "New Profile";
-                FormBorderStyle = FormBorderStyle.FixedDialog;
-                StartPosition = FormStartPosition.CenterParent;
-                MaximizeBox = false;
-                MinimizeBox = false;
-                ClientSize = new Size(320, 120);
-
-                var label = new Label
-                {
-                    Text = "Profile name",
-                    Dock = DockStyle.Top,
-                    Height = 28,
-                    TextAlign = ContentAlignment.MiddleLeft,
-                    Padding = new Padding(12, 0, 0, 0),
-                };
-                Controls.Add(label);
-
-                profileNameTextBox = new TextBox
-                {
-                    Dock = DockStyle.Top,
-                    Margin = new Padding(12),
-                    Text = $"NewProfile_{DateTime.Now:yyyyMMdd_HHmmss}",
-                };
-                Controls.Add(profileNameTextBox);
-
-                var buttonLayout = new FlowLayoutPanel
-                {
-                    Dock = DockStyle.Bottom,
-                    FlowDirection = FlowDirection.RightToLeft,
-                    Height = 44,
-                    Padding = new Padding(8),
-                };
-                Controls.Add(buttonLayout);
-
-                var okButton = new Button
-                {
-                    Text = "OK",
-                    DialogResult = DialogResult.OK,
-                    Width = 80,
-                };
-                buttonLayout.Controls.Add(okButton);
-
-                var cancelButton = new Button
-                {
-                    Text = "Cancel",
-                    DialogResult = DialogResult.Cancel,
-                    Width = 80,
-                };
-                buttonLayout.Controls.Add(cancelButton);
-
-                AcceptButton = okButton;
-                CancelButton = cancelButton;
-            }
-
-            //-------------------------------------------------------------------------------
-            // ファイル名として使えるプロファイル名へ変換する処理
-            //-------------------------------------------------------------------------------
-            private static string SanitizeProfileName(string profileName)
-            {
-                var invalidChars = Path.GetInvalidFileNameChars();
-                var sanitizedName = new string(profileName.Select(x => invalidChars.Contains(x) ? '_' : x).ToArray()).Trim();
-                return sanitizedName.Length == 0 ? "NewProfile" : sanitizedName;
-            }
-        }
-
-        private sealed class DoubleBufferedListView : ListView
-        {
-            //-------------------------------------------------------------------------------
-            // リストビューの描画ちらつきを抑える処理
-            //-------------------------------------------------------------------------------
-            public DoubleBufferedListView()
-            {
-                DoubleBuffered = true;
-            }
-        }
-
-        private sealed class NonKeyboardListBox : ListBox
-        {
-            //-------------------------------------------------------------------------------
-            // 送信キーでプロファイル選択が変わらないようキー操作を無視する処理
-            //-------------------------------------------------------------------------------
-            protected override void OnKeyDown(KeyEventArgs e)
-            {
-                e.Handled = true;
-            }
-
-            //-------------------------------------------------------------------------------
-            // 送信キーでプロファイル選択が変わらないようキー入力を無視する処理
-            //-------------------------------------------------------------------------------
-            protected override void OnKeyPress(KeyPressEventArgs e)
-            {
-                e.Handled = true;
             }
         }
 
@@ -1989,55 +2010,6 @@ namespace Sad2Key
             public uint Pov;
             public uint Reserved1;
             public uint Reserved2;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct Input
-        {
-            public uint Type;
-            public InputUnion Data;
-        }
-
-        [StructLayout(LayoutKind.Explicit)]
-        private struct InputUnion
-        {
-            [FieldOffset(0)]
-            public KeyboardInput Keyboard;
-
-            [FieldOffset(0)]
-            public MouseInput Mouse;
-
-            [FieldOffset(0)]
-            public HardwareInput Hardware;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct KeyboardInput
-        {
-            public ushort VirtualKey;
-            public ushort Scan;
-            public uint Flags;
-            public uint Time;
-            public IntPtr ExtraInfo;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MouseInput
-        {
-            public int X;
-            public int Y;
-            public uint MouseData;
-            public uint Flags;
-            public uint Time;
-            public IntPtr ExtraInfo;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct HardwareInput
-        {
-            public uint Message;
-            public ushort ParamL;
-            public ushort ParamH;
         }
     }
 }

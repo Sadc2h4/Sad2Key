@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -10,13 +10,21 @@
     <Company></Company>
     <AssemblyTitle>Sad2Key</AssemblyTitle>
     <Product>Sad2Key</Product>
+    <Version>1.0.0</Version>
+    <ApplicationIcon>..\exe_icon.ico</ApplicationIcon>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="..\..\BetterJoy-master\BetterJoyForCemu\x64\hidapi.dll">
+    <!-- 開発ビルド用: exeの横にhidapi.dllを置く（publish時は埋め込み版を使うためコピーしない） -->
+    <Content Include="lib\hidapi.dll">
       <Link>hidapi.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </Content>
+    <!-- 単一exe配布用: hidapi.dllとアイコンを埋め込む -->
+    <EmbeddedResource Include="lib\hidapi.dll" LogicalName="hidapi.dll" />
+    <EmbeddedResource Include="..\exe_icon.ico" LogicalName="Sad2Key.exe_icon.ico" />
   </ItemGroup>
 
 </Project>

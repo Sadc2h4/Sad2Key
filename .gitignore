@@ -2,3 +2,6 @@ bin/
 obj/
 .vs/
 *.user
+dist/
+README(例).md
+device_controls_ui.png

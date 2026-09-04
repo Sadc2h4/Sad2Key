@@ -21,6 +21,12 @@ namespace Sad2Key
         public string Path { get; }
 
         //-------------------------------------------------------------------------------
+        // Joy-Con単体のスティックを横持ち（レールが上）基準でPOVへ変換するか
+        // JoyToKeyがBluetooth簡易HIDモードで見るハットスイッチの向きに合わせるための設定
+        //-------------------------------------------------------------------------------
+        public bool SidewaysStick { get; set; } = true;
+
+        //-------------------------------------------------------------------------------
         // Nintendo Switch系コントローラーを初期化する処理
         //-------------------------------------------------------------------------------
         private SwitchHidController(IntPtr handle, string path, string name, bool isLeft, bool isPro)
@@ -182,6 +188,7 @@ namespace Sad2Key
 
             AddButtonInputs(inputs, report);
             AddStickInputs(inputs, report);
+            AddJoyToKeyCompatibleInputs(inputs);
             lastInputs.Clear();
 
             foreach (var inputName in inputs)
@@ -194,58 +201,129 @@ namespace Sad2Key
 
         //-------------------------------------------------------------------------------
         // HIDレポートのボタン情報を入力名へ変換する処理
+        // report[3]=右側ボタン，report[4]=共通ボタン，report[5]=左側ボタン（BetterJoy準拠）
         //-------------------------------------------------------------------------------
         private void AddButtonInputs(HashSet<string> inputs, byte[] report)
         {
-            AddInput(inputs, "SwitchDPadDown", (report[3 + (isLeft ? 2 : 0)] & (isLeft ? 0x01 : 0x04)) != 0);
-            AddInput(inputs, "SwitchDPadRight", (report[3 + (isLeft ? 2 : 0)] & (isLeft ? 0x04 : 0x08)) != 0);
-            AddInput(inputs, "SwitchDPadUp", (report[3 + (isLeft ? 2 : 0)] & 0x02) != 0);
-            AddInput(inputs, "SwitchDPadLeft", (report[3 + (isLeft ? 2 : 0)] & (isLeft ? 0x08 : 0x01)) != 0);
-            AddInput(inputs, "SwitchMinus", (report[4] & 0x01) != 0);
-            AddInput(inputs, "SwitchPlus", (report[4] & 0x02) != 0);
-            AddInput(inputs, "SwitchStick", (report[4] & (isLeft ? 0x08 : 0x04)) != 0);
-            AddInput(inputs, "SwitchHome", (report[4] & 0x10) != 0);
-            AddInput(inputs, "SwitchCapture", (report[4] & 0x20) != 0);
-            AddInput(inputs, "SwitchL", (report[3 + (isLeft ? 2 : 0)] & 0x40) != 0);
-            AddInput(inputs, "SwitchZL", (report[3 + (isLeft ? 2 : 0)] & 0x80) != 0);
-            AddInput(inputs, "SwitchSL", (report[3 + (isLeft ? 2 : 0)] & 0x10) != 0);
-            AddInput(inputs, "SwitchSR", (report[3 + (isLeft ? 2 : 0)] & 0x20) != 0);
-            AddJoyToKeyCompatibleInputs(inputs);
+            var rightByte = report[3];
+            var sharedByte = report[4];
+            var leftByte = report[5];
 
-            if (!isPro)
+            AddInput(inputs, "SwitchMinus", (sharedByte & 0x01) != 0);
+            AddInput(inputs, "SwitchPlus", (sharedByte & 0x02) != 0);
+            AddInput(inputs, "SwitchHome", (sharedByte & 0x10) != 0);
+            AddInput(inputs, "SwitchCapture", (sharedByte & 0x20) != 0);
+
+            if (isLeft)
             {
-                return;
+                AddInput(inputs, "SwitchDPadDown", (leftByte & 0x01) != 0);
+                AddInput(inputs, "SwitchDPadUp", (leftByte & 0x02) != 0);
+                AddInput(inputs, "SwitchDPadRight", (leftByte & 0x04) != 0);
+                AddInput(inputs, "SwitchDPadLeft", (leftByte & 0x08) != 0);
+                AddInput(inputs, "SwitchSR", (leftByte & 0x10) != 0);
+                AddInput(inputs, "SwitchSL", (leftByte & 0x20) != 0);
+                AddInput(inputs, "SwitchL", (leftByte & 0x40) != 0);
+                AddInput(inputs, "SwitchZL", (leftByte & 0x80) != 0);
+                AddInput(inputs, "SwitchStick", (sharedByte & 0x08) != 0);
             }
 
-            AddInput(inputs, "SwitchY", (report[3] & 0x01) != 0);
-            AddInput(inputs, "SwitchX", (report[3] & 0x02) != 0);
-            AddInput(inputs, "SwitchB", (report[3] & 0x04) != 0);
-            AddInput(inputs, "SwitchA", (report[3] & 0x08) != 0);
-            AddInput(inputs, "SwitchR", (report[3] & 0x40) != 0);
-            AddInput(inputs, "SwitchZR", (report[3] & 0x80) != 0);
-            AddInput(inputs, "SwitchRightStick", (report[4] & 0x04) != 0);
-            AddJoyToKeyCompatibleInputs(inputs);
+            if (!isLeft || isPro)
+            {
+                AddInput(inputs, "SwitchY", (rightByte & 0x01) != 0);
+                AddInput(inputs, "SwitchX", (rightByte & 0x02) != 0);
+                AddInput(inputs, "SwitchB", (rightByte & 0x04) != 0);
+                AddInput(inputs, "SwitchA", (rightByte & 0x08) != 0);
+                AddInput(inputs, "SwitchR", (rightByte & 0x40) != 0);
+                AddInput(inputs, "SwitchZR", (rightByte & 0x80) != 0);
+                AddInput(inputs, "SwitchRightStick", (sharedByte & 0x04) != 0);
+            }
+
+            if (!isLeft)
+            {
+                AddInput(inputs, "SwitchSR", (rightByte & 0x10) != 0);   // Joy-Con R単体のSL/SRは右側バイトにある
+                AddInput(inputs, "SwitchSL", (rightByte & 0x20) != 0);
+            }
         }
 
         //-------------------------------------------------------------------------------
-        // Switch入力名からJoyToKey互換のボタン番号を追加する処理
+        // Switch入力名からJoyToKey互換のボタン番号とPOV名を追加する処理
+        // Bluetooth接続時にJoyToKey（DirectInput）が見る番号に合わせて種別ごとに変える
         //-------------------------------------------------------------------------------
-        private static void AddJoyToKeyCompatibleInputs(HashSet<string> inputs)
+        private void AddJoyToKeyCompatibleInputs(HashSet<string> inputs)
         {
-            AddAliasInput(inputs, "SwitchB", "Button01");
-            AddAliasInput(inputs, "SwitchA", "Button02");
-            AddAliasInput(inputs, "SwitchY", "Button03");
-            AddAliasInput(inputs, "SwitchX", "Button04");
-            AddAliasInput(inputs, "SwitchL", "Button05");
-            AddAliasInput(inputs, "SwitchR", "Button06");
-            AddAliasInput(inputs, "SwitchZL", "Button07");
-            AddAliasInput(inputs, "SwitchZR", "Button08");
-            AddAliasInput(inputs, "SwitchMinus", "Button09");
+            if (isPro)
+            {
+                AddAliasInput(inputs, "SwitchB", "Button01");
+                AddAliasInput(inputs, "SwitchA", "Button02");
+                AddAliasInput(inputs, "SwitchY", "Button03");
+                AddAliasInput(inputs, "SwitchX", "Button04");
+                AddAliasInput(inputs, "SwitchL", "Button05");
+                AddAliasInput(inputs, "SwitchR", "Button06");
+                AddAliasInput(inputs, "SwitchZL", "Button07");
+                AddAliasInput(inputs, "SwitchZR", "Button08");
+                AddAliasInput(inputs, "SwitchMinus", "Button09");
+                AddAliasInput(inputs, "SwitchPlus", "Button10");
+                AddAliasInput(inputs, "SwitchStick", "Button11");
+                AddAliasInput(inputs, "SwitchRightStick", "Button12");
+                AddAliasInput(inputs, "SwitchHome", "Button13");
+                AddAliasInput(inputs, "SwitchCapture", "Button14");
+                AddAliasInput(inputs, "SwitchDPadUp", "PovUp");
+                AddAliasInput(inputs, "SwitchDPadRight", "PovRight");
+                AddAliasInput(inputs, "SwitchDPadDown", "PovDown");
+                AddAliasInput(inputs, "SwitchDPadLeft", "PovLeft");
+                return;
+            }
+
+            if (isLeft)
+            {
+                AddAliasInput(inputs, "SwitchDPadLeft", "Button01");     // 横持ち時の下＝Button01
+                AddAliasInput(inputs, "SwitchDPadDown", "Button02");     // 横持ち時の右＝Button02
+                AddAliasInput(inputs, "SwitchDPadUp", "Button03");       // 横持ち時の左＝Button03
+                AddAliasInput(inputs, "SwitchDPadRight", "Button04");    // 横持ち時の上＝Button04
+                AddAliasInput(inputs, "SwitchSL", "Button05");
+                AddAliasInput(inputs, "SwitchSR", "Button06");
+                AddAliasInput(inputs, "SwitchMinus", "Button09");
+                AddAliasInput(inputs, "SwitchStick", "Button11");
+                AddAliasInput(inputs, "SwitchCapture", "Button14");
+                AddAliasInput(inputs, "SwitchL", "Button15");
+                AddAliasInput(inputs, "SwitchZL", "Button16");
+                AddJoyConStickPovInputs(inputs, "SwitchAxisRight", "SwitchAxisDown", "SwitchAxisLeft", "SwitchAxisUp");
+                return;
+            }
+
+            AddAliasInput(inputs, "SwitchA", "Button01");                // 横持ち時の下＝Button01
+            AddAliasInput(inputs, "SwitchX", "Button02");                // 横持ち時の右＝Button02
+            AddAliasInput(inputs, "SwitchB", "Button03");                // 横持ち時の左＝Button03
+            AddAliasInput(inputs, "SwitchY", "Button04");                // 横持ち時の上＝Button04
+            AddAliasInput(inputs, "SwitchSL", "Button05");
+            AddAliasInput(inputs, "SwitchSR", "Button06");
             AddAliasInput(inputs, "SwitchPlus", "Button10");
-            AddAliasInput(inputs, "SwitchStick", "Button11");
             AddAliasInput(inputs, "SwitchRightStick", "Button12");
             AddAliasInput(inputs, "SwitchHome", "Button13");
-            AddAliasInput(inputs, "SwitchCapture", "Button14");
+            AddAliasInput(inputs, "SwitchR", "Button15");
+            AddAliasInput(inputs, "SwitchZR", "Button16");
+            AddJoyConStickPovInputs(inputs, "SwitchAxisLeft", "SwitchAxisUp", "SwitchAxisRight", "SwitchAxisDown");
+        }
+
+        //-------------------------------------------------------------------------------
+        // Joy-Con単体のスティック入力をPOV名へ変換する処理
+        // 引数は横持ち時に上・右・下・左になる縦持ち基準の軸入力名
+        //-------------------------------------------------------------------------------
+        private void AddJoyConStickPovInputs(HashSet<string> inputs, string sidewaysUp, string sidewaysRight, string sidewaysDown, string sidewaysLeft)
+        {
+            if (SidewaysStick)
+            {
+                AddAliasInput(inputs, sidewaysUp, "PovUp");
+                AddAliasInput(inputs, sidewaysRight, "PovRight");
+                AddAliasInput(inputs, sidewaysDown, "PovDown");
+                AddAliasInput(inputs, sidewaysLeft, "PovLeft");
+                return;
+            }
+
+            AddAliasInput(inputs, "SwitchAxisUp", "PovUp");
+            AddAliasInput(inputs, "SwitchAxisRight", "PovRight");
+            AddAliasInput(inputs, "SwitchAxisDown", "PovDown");
+            AddAliasInput(inputs, "SwitchAxisLeft", "PovLeft");
         }
 
         //-------------------------------------------------------------------------------

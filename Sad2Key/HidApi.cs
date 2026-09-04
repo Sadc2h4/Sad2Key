@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace Sad2Key
@@ -24,6 +25,92 @@ namespace Sad2Key
             public ushort Usage;
             public int InterfaceNumber;
             public IntPtr Next;
+        }
+
+        //-------------------------------------------------------------------------------
+        // hidapi.dllの探索先を登録する処理（単一exe配布時は埋め込みリソースから展開する）
+        //-------------------------------------------------------------------------------
+        static HidApi()
+        {
+            NativeLibrary.SetDllImportResolver(typeof(HidApi).Assembly, ResolveNativeLibrary);
+        }
+
+        //-------------------------------------------------------------------------------
+        // hidapi.dllをexeフォルダ→展開済みフォルダの順に探して読み込む処理
+        //-------------------------------------------------------------------------------
+        private static IntPtr ResolveNativeLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+        {
+            if (!libraryName.Equals(DllName, StringComparison.OrdinalIgnoreCase))
+            {
+                return IntPtr.Zero;
+            }
+
+            foreach (var candidatePath in EnumerateCandidatePaths())
+            {
+                if (File.Exists(candidatePath) && NativeLibrary.TryLoad(candidatePath, out var handle))
+                {
+                    return handle;
+                }
+            }
+
+            return IntPtr.Zero;                                             // 見つからなければ既定の探索に任せる
+        }
+
+        //-------------------------------------------------------------------------------
+        // hidapi.dllの候補パスを列挙する処理
+        //-------------------------------------------------------------------------------
+        private static IEnumerable<string> EnumerateCandidatePaths()
+        {
+            var executableDirectory = Path.GetDirectoryName(Environment.ProcessPath);
+
+            if (!string.IsNullOrEmpty(executableDirectory))
+            {
+                yield return Path.Combine(executableDirectory, DllName);
+            }
+
+            yield return Path.Combine(AppContext.BaseDirectory, DllName);
+
+            var extractedPath = TryExtractEmbeddedLibrary();
+
+            if (extractedPath is not null)
+            {
+                yield return extractedPath;
+            }
+        }
+
+        //-------------------------------------------------------------------------------
+        // 埋め込みリソースのhidapi.dllをローカルフォルダへ展開しパスを返す処理
+        //-------------------------------------------------------------------------------
+        private static string? TryExtractEmbeddedLibrary()
+        {
+            try
+            {
+                using var resourceStream = typeof(HidApi).Assembly.GetManifestResourceStream(DllName);
+
+                if (resourceStream is null)
+                {
+                    return null;
+                }
+
+                var extractDirectory = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Sad2Key",
+                    "native");
+                Directory.CreateDirectory(extractDirectory);
+                var extractedPath = Path.Combine(extractDirectory, DllName);
+
+                if (!File.Exists(extractedPath) || new FileInfo(extractedPath).Length != resourceStream.Length)
+                {
+                    using var fileStream = File.Create(extractedPath);
+                    resourceStream.CopyTo(fileStream);                      // サイズが違うときだけ書き直す
+                }
+
+                return extractedPath;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         //-------------------------------------------------------------------------------

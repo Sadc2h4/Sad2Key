@@ -1,4 +1,4 @@
-﻿namespace Sad2Key
+namespace Sad2Key
 {
     partial class Form1
     {
@@ -29,9 +29,9 @@
         private void InitializeComponent()
         {
             this.components = new System.ComponentModel.Container();
-            this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(860, 1100);
-            this.MinimumSize = new System.Drawing.Size(760, 720);
+            this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.None;
+            this.ClientSize = new System.Drawing.Size(780, 900);
+            this.MinimumSize = new System.Drawing.Size(700, 760);
             this.Text = "Sad2Key";
         }
 
