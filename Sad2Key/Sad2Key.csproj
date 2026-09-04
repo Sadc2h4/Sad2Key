@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Authors>C2H4</Authors>
+    <Company></Company>
+    <AssemblyTitle>Sad2Key</AssemblyTitle>
+    <Product>Sad2Key</Product>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\BetterJoy-master\BetterJoyForCemu\x64\hidapi.dll">
+      <Link>hidapi.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

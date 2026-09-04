@@ -1,0 +1,73 @@
+■作成時のルールについて
+
+・関数の作成時には関数の上に何をしているものかの注釈を記載してください。
+
+例）
+//-------------------------------------------------------------------------------
+// 四則演算をする処理
+//-------------------------------------------------------------------------------
+static int Arithmetic_operations (int target1, int terget2)
+(以下、処理)
+
+
+・アプリ作成時は作成者をC2H4とし、会社名は未記載にするように変更してください。
+
+・処理内でのコメントなどで句読点を使用する際は『、』の代わりに『，』、『。』の代わりに『．』を使用してください
+
+・処理内で複雑そうなものがある場合は右側にコメントアウトで何の処理かを記載してください
+
+■よく使う汎用処理
+下記の関数はC#でよく使用する関数です。
+
+・FindFirstFile関数
+指定した引数のファイルまたはフォルダを見つかるまで探してパスを返す関数
+
+        //-------------------------------------------------------------------------------
+        //対象のパスからfileNameを見つけるまで探す処理
+        //-------------------------------------------------------------------------------
+        static string FindFirstFile(string directory, string targetName)
+        {
+            try
+            {
+                // フォルダ内のファイルを探索
+                foreach (var file in Directory.GetFiles(directory))
+                {
+                    if (Path.GetFileName(file).Equals(targetName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return file; // 最初に見つかったファイルのフルパスを返す
+                    }
+                }
+
+                // フォルダ内のフォルダを探索（フォルダ名と一致するか確認）
+                foreach (var subDirectory in Directory.GetDirectories(directory))
+                {
+                    if (Path.GetFileName(subDirectory).Equals(targetName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return subDirectory; // フォルダ名が一致した場合、そのパスを返す
+                    }
+
+                    // 再帰的に探索
+                    var result = FindFirstFile(subDirectory, targetName);
+                    if (!string.IsNullOrEmpty(result))
+                    {
+                        return result; // 見つかった場合はそのフルパスを返す
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                //string Exception = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, targetName);
+                //return Exception;
+            }
+            catch (Exception ex)
+            {
+                // 対象が見つからない場合はResourceフォルダ内に作成
+                //string Exception = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, targetName);
+                //return Exception;
+            }
+
+            return null;
+        }
+
+・
+
